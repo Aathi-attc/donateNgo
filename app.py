@@ -1,110 +1,147 @@
-"""donateNgo — Flask app backed by the local MySQL NGODatabase.
+#donateNgo — a Flask website backed by the MySQL NGODatabase.
 
-The single-page front-end (templates/donateNgo.html) reads and writes
-everything through these API endpoints, so the MySQL database on this
-machine is the real source of truth. To let other computers on the
-local network use the same database, run Flask on 0.0.0.0 (default
-below) and point those machines at this computer's LAN IP.
-"""
 import json
 from datetime import datetime
 
 import pymysql
-from flask import Flask, g, jsonify, render_template, request
-
-DB_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "deens",
-    "database": "NGODatabase",
-    "charset": "utf8mb4",
-    "cursorclass": pymysql.cursors.DictCursor,
-    "autocommit": True,
-}
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
-
-def get_db():
-    if "db" not in g:
-        g.db = pymysql.connect(**DB_CONFIG)
-    return g.db
+# The columns used every time we read a user from the users table.
+USER_FIELDS = "id,name,email,location,causes,avatar_color,avatar_image,since"
 
 
-@app.teardown_appcontext
-def close_db(_exc):
-    g.pop("db", None)
+def connect():
+    """Open a connection to the NGODatabase on this computer."""
+    conn = pymysql.connect(
+        host="127.0.0.1",
+        port=3306,
+        user="root",
+        password="deens",
+        database="NGODatabase",
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    return conn
 
 
-def query(sql, args=None):
-    with get_db().cursor() as cur:
-        cur.execute(sql, args or ())
-        return cur.fetchall()
+def run_select(sql, values=()):
+    """Run a SELECT query and return all the rows as a list of dicts."""
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(sql, values)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 
-def execute(sql, args=None):
-    with get_db().cursor() as cur:
-        cur.execute(sql, args or ())
-        return cur.lastrowid
+def run_insert(sql, values=()):
+    """Run an INSERT query and return the id of the new row."""
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(sql, values)
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    conn.close()
+    return new_id
 
 
-def iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") if dt else None
+def run_change(sql, values=()):
+    """Run an UPDATE or DELETE query and return how many rows changed."""
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(sql, values)
+    conn.commit()
+    changed = cur.rowcount
+    cur.close()
+    conn.close()
+    return changed
 
 
-def row_user(row):
+def to_iso(dt):
+    """Turn a date-time into text like 2025-01-31T14:30:00."""
+    if dt is None:
+        return None
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def load_json(text):
+    """Read the causes field (stored as JSON text) and return a list."""
+    if text:
+        try:
+            return json.loads(text)
+        except ValueError:
+            return []
+    return []
+
+
+def user_to_dict(row):
+    """Change one row of the users table into the dict the website wants."""
     return {
         "id": row["id"],
         "name": row["name"],
         "email": row["email"],
         "location": row["location"],
-        "causes": json_loads(row["causes"]),
+        "causes": load_json(row["causes"]),
         "avatarColor": row["avatar_color"],
         "avatarImage": row["avatar_image"],
         "since": row["since"],
     }
 
 
-def json_loads(value):
-    try:
-        return json.loads(value or "[]")
-    except (ValueError, TypeError):
-        return []
+def make_chart(rows):
+    """Make a bar chart from (date, amount) pairs.
 
-
-def donation_series(rows):
-    """Aggregate live donations into a day/month/year series so the donation
-    report timeline adapts to how recent the giving is:
-      donations within ~2 months  -> by day
-      donations within ~2 years   -> by month
-      donations older / spread out -> by year
+    Recent donations (within 2 months) are grouped by day, donations
+    within about 2 years by month, and everything older by year.
     """
-    if not rows:
+    if len(rows) == 0:
         return {"granularity": "year", "labels": [], "values": [], "live": True}
-    rows = sorted(rows, key=lambda x: x[0])
-    span_days = (rows[-1][0] - rows[0][0]).days
-    if span_days <= 60:
-        granularity, keyfmt, labelfmt = "day", "%Y-%m-%d", "%d %b"
-    elif span_days <= 730:
-        granularity, keyfmt, labelfmt = "month", "%Y-%m", "%b '%y"
+
+    rows.sort()
+    first_date = rows[0][0]
+    last_date = rows[-1][0]
+    total_days = (last_date - first_date).days
+
+    if total_days <= 60:
+        granularity = "day"
+        key_format = "%Y-%m-%d"
+        label_format = "%d %b"
+    elif total_days <= 730:
+        granularity = "month"
+        key_format = "%Y-%m"
+        label_format = "%b '%y"
     else:
-        granularity, keyfmt, labelfmt = "year", "%Y", "%Y"
+        granularity = "year"
+        key_format = "%Y"
+        label_format = "%Y"
+
     buckets = {}
-    for dt, amt in rows:
-        key = dt.strftime(keyfmt)
-        b = buckets.setdefault(key, {"label": dt.strftime(labelfmt), "total": 0.0})
-        b["total"] += amt
-    order = sorted(buckets)
+    for row in rows:
+        dt = row[0]
+        amount = row[1]
+        key = dt.strftime(key_format)
+        if key not in buckets:
+            buckets[key] = {"label": dt.strftime(label_format), "total": 0.0}
+        buckets[key]["total"] = buckets[key]["total"] + amount
+
+    keys = list(buckets.keys())
+    keys.sort()
+    labels = []
+    values = []
+    for key in keys:
+        labels.append(buckets[key]["label"])
+        values.append(round(buckets[key]["total"]))
+
     return {
         "granularity": granularity,
-        "labels": [buckets[k]["label"] for k in order],
-        "values": [round(buckets[k]["total"]) for k in order],
+        "labels": labels,
+        "values": values,
         "live": True,
     }
-
-
-USER_FIELDS = "id,name,email,location,causes,avatar_color,avatar_image,since"
 
 
 @app.route("/")
@@ -114,265 +151,329 @@ def index():
 
 @app.route("/api/ngos")
 def api_ngos():
-    ngos = query(
-        "SELECT id,name,tagline,category,location,founded,verified,impact,"
+    ngos = run_select(
+        "SELECT id,name,tagline,category,location,founded,verified,"
         "description,email,phone,website FROM ngos ORDER BY id"
     )
 
-    # Real donations made through the app (live data).
-    don_rows = query(
+    # All donations, grouped by NGO (used for the chart).
+    donation_rows = run_select(
         "SELECT ngo_id, created_at, amount FROM donations ORDER BY created_at"
     )
-    real_by = {}
-    for r in don_rows:
-        real_by.setdefault(r["ngo_id"], []).append((r["created_at"], float(r["amount"])))
+    donations_by_ngo = {}
+    for row in donation_rows:
+        ngo_id = row["ngo_id"]
+        if ngo_id not in donations_by_ngo:
+            donations_by_ngo[ngo_id] = []
+        donations_by_ngo[ngo_id].append((row["created_at"], float(row["amount"])))
 
-    revs = query(
-        "SELECT id, ngo_id, user_id, COALESCE(NULLIF(user_name,''),'Anonymous') "
-        "AS user_name, rating, text, created_at FROM reviews "
-        "ORDER BY created_at DESC, id DESC"
+    # All reviews, grouped by NGO.
+    review_rows = run_select(
+        "SELECT id,ngo_id,user_id,user_name,rating,text,created_at "
+        "FROM reviews ORDER BY created_at DESC, id DESC"
     )
-    rev_by = {}
-    for r in revs:
-        rev_by.setdefault(r["ngo_id"], []).append(r)
+    reviews_by_ngo = {}
+    for row in review_rows:
+        ngo_id = row["ngo_id"]
+        if ngo_id not in reviews_by_ngo:
+            reviews_by_ngo[ngo_id] = []
+        reviews_by_ngo[ngo_id].append(row)
 
-    # Individual donations (live data) so the report can say who gave how much.
-    don_list = query(
-        "SELECT d.ngo_id, d.amount, d.created_at, "
-        "COALESCE(NULLIF(u.name,''),'Anonymous') AS donor "
-        "FROM donations d LEFT JOIN users u ON u.id=d.user_id "
+    # Every donation with the donor's name, grouped by NGO.
+    don_rows = run_select(
+        "SELECT d.ngo_id, d.amount, d.created_at, u.name "
+        "FROM donations d JOIN users u ON u.id = d.user_id "
         "ORDER BY d.created_at DESC, d.id DESC"
     )
-    don_by = {}
-    for r in don_list:
-        don_by.setdefault(r["ngo_id"], []).append(
+    donlist_by_ngo = {}
+    for row in don_rows:
+        name = row["name"]
+        if name is None or name == "":
+            name = "Anonymous"
+        ngo_id = row["ngo_id"]
+        if ngo_id not in donlist_by_ngo:
+            donlist_by_ngo[ngo_id] = []
+        donlist_by_ngo[ngo_id].append(
             {
-                "user": r["donor"],
-                "amount": float(r["amount"]),
-                "createdAt": iso(r["created_at"]),
+                "user": name,
+                "amount": float(row["amount"]),
+                "createdAt": to_iso(row["created_at"]),
             }
         )
 
-    out = []
-    for n in ngos:
-        nid = n["id"]
-        rl = rev_by.get(nid, [])
-        rating = round(sum(x["rating"] for x in rl) / len(rl), 1) if rl else None
-        # Only real in-app donations appear on the chart; no seed fallback.
-        donations = (
-            donation_series(real_by[nid]) if nid in real_by
-            else {"granularity": "year", "labels": [], "values": [], "live": True}
-        )
-        out.append(
+    result = []
+    for ngo in ngos:
+        ngo_id = ngo["id"]
+        reviews = reviews_by_ngo.get(ngo_id, [])
+
+        if len(reviews) == 0:
+            rating = None
+        else:
+            total = 0
+            for rev in reviews:
+                total = total + rev["rating"]
+            rating = round(total / len(reviews), 1)
+
+        if ngo_id in donations_by_ngo:
+            donations = make_chart(donations_by_ngo[ngo_id])
+        else:
+            donations = {"granularity": "year", "labels": [], "values": [], "live": True}
+
+        review_list = []
+        for rev in reviews:
+            name = rev["user_name"]
+            if name is None or name == "":
+                name = "Anonymous"
+            review_list.append(
+                {
+                    "id": rev["id"],
+                    "userId": rev["user_id"],
+                    "user": name,
+                    "rating": rev["rating"],
+                    "text": rev["text"],
+                    "createdAt": to_iso(rev["created_at"]),
+                }
+            )
+
+        result.append(
             {
-                "id": nid,
-                "name": n["name"],
-                "tagline": n["tagline"],
-                "category": n["category"],
-                "location": n["location"],
-                "founded": n["founded"],
-                "verified": bool(n["verified"]),
-                "impact": n["impact"],
-                "desc": n["description"],
-                "email": n["email"],
-                "phone": n["phone"],
-                "website": n["website"],
+                "id": ngo_id,
+                "name": ngo["name"],
+                "tagline": ngo["tagline"],
+                "category": ngo["category"],
+                "location": ngo["location"],
+                "founded": ngo["founded"],
+                "verified": bool(ngo["verified"]),
+                "desc": ngo["description"],
+                "email": ngo["email"],
+                "phone": ngo["phone"],
+                "website": ngo["website"],
                 "rating": rating,
-                "reviews": len(rl),
+                "reviews": len(reviews),
                 "donations": donations,
-                "donationsList": don_by.get(nid, []),
-                "reviewsList": [
-                    {
-                        "id": r["id"],
-                        "userId": r["user_id"],
-                        "user": r["user_name"],
-                        "rating": r["rating"],
-                        "text": r["text"],
-                        "createdAt": iso(r["created_at"]),
-                    }
-                    for r in rl
-                ],
+                "donationsList": donlist_by_ngo.get(ngo_id, []),
+                "reviewsList": review_list,
             }
         )
 
-    # Content version: changes whenever an NGO is added/removed, a review is
-    # written, or a donation lands, so clients can refresh without reloading.
-    rev_max = max((r["id"] for r in revs), default=0)
-    don_max = query("SELECT COALESCE(MAX(id),0) AS m FROM donations")[0]["m"]
-    version = "{}-{}-{}".format(len(ngos), rev_max, don_max)
-    return jsonify({"version": version, "ngos": out})
+    # Version number: changes whenever an NGO, a review or a donation
+    # changes, so the website knows to refresh itself.
+    max_review_id = 0
+    for rev in review_rows:
+        if rev["id"] > max_review_id:
+            max_review_id = rev["id"]
+    max_donation = run_select("SELECT MAX(id) AS m FROM donations")[0]
+    max_donation_id = max_donation["m"]
+    if max_donation_id is None:
+        max_donation_id = 0
+    version = str(len(ngos)) + "-" + str(max_review_id) + "-" + str(max_donation_id)
+
+    return jsonify({"version": version, "ngos": result})
 
 
 @app.route("/api/me")
 def api_me():
-    uid = request.args.get("id")
-    rows = query(f"SELECT {USER_FIELDS} FROM users WHERE id=%s", (uid,))
-    if not rows:
+    user_id = request.args.get("id")
+    rows = run_select("SELECT " + USER_FIELDS + " FROM users WHERE id=%s", (user_id,))
+    if len(rows) == 0:
         return jsonify({"error": "User not found"}), 404
-    return jsonify(row_user(rows[0]))
+    return jsonify(user_to_dict(rows[0]))
 
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    d = request.get_json(force=True)
-    email = (d.get("email") or "").strip().lower()
-    rows = query(
-        f"SELECT {USER_FIELDS} FROM users WHERE email=%s AND password_hash=%s",
-        (email, d.get("password_hash", "")),
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+    rows = run_select(
+        "SELECT " + USER_FIELDS + " FROM users WHERE email=%s AND password_hash=%s",
+        (email, data.get("password_hash", "")),
     )
-    if not rows:
+    if len(rows) == 0:
         return jsonify({"error": "Incorrect email or password."}), 401
-    return jsonify(row_user(rows[0]))
+    return jsonify(user_to_dict(rows[0]))
 
 
 @app.route("/api/register", methods=["POST"])
 def api_register():
-    d = request.get_json(force=True)
-    email = (d.get("email") or "").strip().lower()
-    if query("SELECT id FROM users WHERE email=%s", (email,)):
+    data = request.get_json(force=True)
+    email = (data.get("email") or "").strip().lower()
+
+    exists = run_select("SELECT id FROM users WHERE email=%s", (email,))
+    if len(exists) > 0:
         return (
             jsonify(
                 {"error": "An account with this email already exists — try signing in."}
             ),
             409,
         )
-    uid = execute(
+
+    new_id = run_insert(
         "INSERT INTO users (name,email,password_hash,location,causes,"
         "avatar_color,avatar_image,since,created_at) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
-            (d.get("name") or "").strip(),
+            (data.get("name") or "").strip(),
             email,
-            d.get("password_hash", ""),
-            d.get("location") or "Bengaluru, Karnataka",
-            json.dumps(d.get("causes") or []),
-            d.get("avatar_color", 0),
+            data.get("password_hash", ""),
+            data.get("location") or "Bengaluru, Karnataka",
+            json.dumps(data.get("causes") or []),
+            data.get("avatar_color", 0),
             None,
-            d.get("since") or datetime.now().year,
+            data.get("since") or datetime.now().year,
             datetime.now(),
         ),
     )
-    rows = query(f"SELECT {USER_FIELDS} FROM users WHERE id=%s", (uid,))
-    return jsonify(row_user(rows[0])), 201
+    rows = run_select("SELECT " + USER_FIELDS + " FROM users WHERE id=%s", (new_id,))
+    return jsonify(user_to_dict(rows[0])), 201
 
 
 @app.route("/api/me", methods=["PUT"])
 def api_me_update():
-    d = request.get_json(force=True)
-    uid = d.get("id")
-    email = (d.get("email") or "").strip().lower()
-    if query("SELECT id FROM users WHERE email=%s AND id<>%s", (email, uid)):
+    data = request.get_json(force=True)
+    user_id = data.get("id")
+    email = (data.get("email") or "").strip().lower()
+
+    conflict = run_select(
+        "SELECT id FROM users WHERE email=%s AND id<>%s", (email, user_id)
+    )
+    if len(conflict) > 0:
         return jsonify({"error": "That email is already used by another account."}), 409
-    execute(
+
+    run_change(
         "UPDATE users SET name=%s,email=%s,location=%s,causes=%s,avatar_color=%s,"
         "avatar_image=%s WHERE id=%s",
         (
-            (d.get("name") or "").strip(),
+            (data.get("name") or "").strip(),
             email,
-            d.get("location") or "",
-            json.dumps(d.get("causes") or []),
-            d.get("avatar_color", 0),
-            d.get("avatar_image"),
-            uid,
+            data.get("location") or "",
+            json.dumps(data.get("causes") or []),
+            data.get("avatar_color", 0),
+            data.get("avatar_image"),
+            user_id,
         ),
     )
-    rows = query(f"SELECT {USER_FIELDS} FROM users WHERE id=%s", (uid,))
-    if not rows:
+    rows = run_select("SELECT " + USER_FIELDS + " FROM users WHERE id=%s", (user_id,))
+    if len(rows) == 0:
         return jsonify({"error": "User not found"}), 404
-    return jsonify(row_user(rows[0]))
+    return jsonify(user_to_dict(rows[0]))
 
 
 @app.route("/api/me/profile")
 def api_me_profile():
-    uid = request.args.get("id")
-    rows = query(f"SELECT {USER_FIELDS} FROM users WHERE id=%s", (uid,))
-    if not rows:
+    user_id = request.args.get("id")
+    rows = run_select("SELECT " + USER_FIELDS + " FROM users WHERE id=%s", (user_id,))
+    if len(rows) == 0:
         return jsonify({"error": "User not found"}), 404
 
-    stats = query(
-        "SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS cnt "
+    # How much this user has donated in total.
+    stat_row = run_select(
+        "SELECT SUM(amount) AS total, COUNT(*) AS cnt "
         "FROM donations WHERE user_id=%s",
-        (uid,),
-    )
-    rev_cnt = query("SELECT COUNT(*) AS cnt FROM reviews WHERE user_id=%s", (uid,))
-    by_year = query(
+        (user_id,),
+    )[0]
+    total = stat_row["total"]
+    if total is None:
+        total = 0
+    count = stat_row["cnt"]
+
+    review_count = run_select(
+        "SELECT COUNT(*) AS cnt FROM reviews WHERE user_id=%s", (user_id,)
+    )[0]["cnt"]
+
+    # Donation total for each year (for the profile page).
+    year_rows = run_select(
         "SELECT YEAR(created_at) AS yr, SUM(amount) AS total "
         "FROM donations WHERE user_id=%s GROUP BY YEAR(created_at) ORDER BY yr",
-        (uid,),
+        (user_id,),
     )
-    # Adaptive day/month/year giving-history series, same logic as the NGO
-    # donation report so the profile chart matches its granularity.
-    giving_rows = query(
-        "SELECT created_at, amount FROM donations WHERE user_id=%s ORDER BY created_at",
-        (uid,),
+    by_year = []
+    for row in year_rows:
+        by_year.append({"yr": row["yr"], "total": float(row["total"])})
+
+    # Giving-history chart, same grouping as the NGO chart.
+    giving_rows = run_select(
+        "SELECT created_at, amount FROM donations "
+        "WHERE user_id=%s ORDER BY created_at",
+        (user_id,),
     )
-    giving_chart = donation_series(
-        [(r["created_at"], float(r["amount"])) for r in giving_rows]
-    )
-    my_reviews = query(
+    giving_pairs = []
+    for row in giving_rows:
+        giving_pairs.append((row["created_at"], float(row["amount"])))
+    giving_chart = make_chart(giving_pairs)
+
+    # This user's reviews, with the name of each NGO they reviewed.
+    review_rows = run_select(
         "SELECT r.rating, r.text, r.created_at, n.name AS ngo_name, n.id AS ngo_id "
-        "FROM reviews r JOIN ngos n ON n.id=r.ngo_id "
+        "FROM reviews r JOIN ngos n ON n.id = r.ngo_id "
         "WHERE r.user_id=%s ORDER BY r.created_at DESC, r.id DESC",
-        (uid,),
+        (user_id,),
     )
-    my_dons = query(
+    my_reviews = []
+    for row in review_rows:
+        my_reviews.append(
+            {
+                "rating": row["rating"],
+                "text": row["text"],
+                "createdAt": to_iso(row["created_at"]),
+                "ngoName": row["ngo_name"],
+                "ngoId": row["ngo_id"],
+            }
+        )
+
+    # This user's donations, with the name of each NGO they donated to.
+    donation_rows = run_select(
         "SELECT d.amount, d.created_at, n.name AS ngo_name, n.id AS ngo_id, d.status "
-        "FROM donations d JOIN ngos n ON n.id=d.ngo_id "
+        "FROM donations d JOIN ngos n ON n.id = d.ngo_id "
         "WHERE d.user_id=%s ORDER BY d.created_at DESC, d.id DESC",
-        (uid,),
+        (user_id,),
     )
+    my_donations = []
+    for row in donation_rows:
+        my_donations.append(
+            {
+                "amount": float(row["amount"]),
+                "createdAt": to_iso(row["created_at"]),
+                "ngoName": row["ngo_name"],
+                "ngoId": row["ngo_id"],
+                "status": row["status"],
+            }
+        )
 
     return jsonify(
         {
-            "user": row_user(rows[0]),
-            "total": float(stats[0]["total"]),
-            "count": int(stats[0]["cnt"]),
-            "reviewCount": int(rev_cnt[0]["cnt"]),
-            "byYear": [
-                {"yr": r["yr"], "total": float(r["total"])} for r in by_year
-            ],
+            "user": user_to_dict(rows[0]),
+            "total": float(total),
+            "count": int(count),
+            "reviewCount": int(review_count),
+            "byYear": by_year,
             "chart": giving_chart,
-            "reviews": [
-                {
-                    "rating": r["rating"],
-                    "text": r["text"],
-                    "createdAt": iso(r["created_at"]),
-                    "ngoName": r["ngo_name"],
-                    "ngoId": r["ngo_id"],
-                }
-                for r in my_reviews
-            ],
-            "donations": [
-                {
-                    "amount": float(r["amount"]),
-                    "createdAt": iso(r["created_at"]),
-                    "ngoName": r["ngo_name"],
-                    "ngoId": r["ngo_id"],
-                    "status": r["status"],
-                }
-                for r in my_dons
-            ],
+            "reviews": my_reviews,
+            "donations": my_donations,
         }
     )
 
 
 @app.route("/api/stats")
 def api_stats():
-    verified = query("SELECT COUNT(*) AS c FROM ngos WHERE verified=1")[0]["c"]
-    total_ngos = query("SELECT COUNT(*) AS c FROM ngos")[0]["c"]
-    reviews = query("SELECT COUNT(*) AS c FROM reviews")[0]["c"]
-    don_row = query(
-        "SELECT COALESCE(SUM(amount),0) AS s, COUNT(*) AS c FROM donations"
-    )[0]
-    cats = query("SELECT COUNT(DISTINCT category) AS c FROM ngos")[0]["c"]
-    users = query("SELECT COUNT(*) AS c FROM users")[0]["c"]
+    verified = run_select("SELECT COUNT(*) AS c FROM ngos WHERE verified=1")[0]["c"]
+    total_ngos = run_select("SELECT COUNT(*) AS c FROM ngos")[0]["c"]
+    reviews = run_select("SELECT COUNT(*) AS c FROM reviews")[0]["c"]
+
+    don_row = run_select("SELECT SUM(amount) AS s, COUNT(*) AS c FROM donations")[0]
+    amount = don_row["s"]
+    if amount is None:
+        amount = 0
+
+    cats = run_select("SELECT COUNT(DISTINCT category) AS c FROM ngos")[0]["c"]
+    users = run_select("SELECT COUNT(*) AS c FROM users")[0]["c"]
+
     return jsonify(
         {
             "verifiedNgos": int(verified),
             "totalNgos": int(total_ngos),
             "donorReviews": int(reviews),
             "totalDonations": int(don_row["c"]),
-            "trackedRupees": float(don_row["s"]),
+            "trackedRupees": float(amount),
             "categories": int(cats),
             "activeUsers": int(users),
         }
@@ -381,32 +482,31 @@ def api_stats():
 
 @app.route("/api/me/password", methods=["POST"])
 def api_me_password():
-    d = request.get_json(force=True)
-    uid = d.get("id")
-    rows = query("SELECT password_hash FROM users WHERE id=%s", (uid,))
-    if not rows:
+    data = request.get_json(force=True)
+    user_id = data.get("id")
+    rows = run_select("SELECT password_hash FROM users WHERE id=%s", (user_id,))
+    if len(rows) == 0:
         return jsonify({"error": "User not found"}), 404
-    if rows[0]["password_hash"] != d.get("current_hash", ""):
+    if rows[0]["password_hash"] != data.get("current_hash", ""):
         return jsonify({"error": "Current password is incorrect."}), 400
-    new_hash = (d.get("new_hash") or "").strip()
-    if not new_hash:
+
+    new_hash = (data.get("new_hash") or "").strip()
+    if new_hash == "":
         return jsonify({"error": "New password is missing."}), 400
-    execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, uid))
+
+    run_change("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, user_id))
     return jsonify({"ok": True})
 
 
 @app.route("/api/reviews", methods=["POST", "DELETE"])
 def api_review():
-    d = request.get_json(force=True)
+    data = request.get_json(force=True)
     if request.method == "DELETE":
-        cur = get_db().cursor()
-        cur.execute(
+        deleted = run_change(
             "DELETE FROM reviews WHERE id=%s AND user_id=%s",
-            (d.get("id"), d.get("user_id")),
+            (data.get("id"), data.get("user_id")),
         )
-        deleted = cur.rowcount
-        cur.close()
-        if not deleted:
+        if deleted == 0:
             return (
                 jsonify(
                     {"error": "Review not found, or you can only delete your own reviews."}
@@ -414,15 +514,16 @@ def api_review():
                 404,
             )
         return jsonify({"ok": True})
-    execute(
+
+    run_insert(
         "INSERT INTO reviews (ngo_id,user_id,user_name,rating,text,created_at) "
         "VALUES (%s,%s,%s,%s,%s,%s)",
         (
-            d.get("ngo_id"),
-            d.get("user_id"),
-            (d.get("user_name") or "Anonymous"),
-            int(d.get("rating", 5)),
-            d.get("text", ""),
+            data.get("ngo_id"),
+            data.get("user_id"),
+            data.get("user_name") or "Anonymous",
+            int(data.get("rating", 5)),
+            data.get("text", ""),
             datetime.now(),
         ),
     )
@@ -431,16 +532,16 @@ def api_review():
 
 @app.route("/api/donations", methods=["POST"])
 def api_donation():
-    d = request.get_json(force=True)
-    execute(
+    data = request.get_json(force=True)
+    run_insert(
         "INSERT INTO donations (user_id,ngo_id,amount,card_last4,status,created_at) "
         "VALUES (%s,%s,%s,%s,%s,%s)",
         (
-            d.get("user_id"),
-            d.get("ngo_id"),
-            float(d.get("amount", 0)),
-            d.get("card_last4"),
-            d.get("status") or "completed (simulated)",
+            data.get("user_id"),
+            data.get("ngo_id"),
+            float(data.get("amount", 0)),
+            data.get("card_last4"),
+            data.get("status") or "completed (simulated)",
             datetime.now(),
         ),
     )
@@ -448,14 +549,13 @@ def api_donation():
 
 
 if __name__ == "__main__":
-    # Make sure the database exists (creates tables + seeds the NGO catalog
-    # only if empty). This never deletes users or donations, so accounts
-    # survive server restarts.
+    # Create the database and tables if missing (never deletes users or
+    # donations, so accounts survive a server restart).
     try:
         from db_setup import ensure_setup
 
         ensure_setup()
-    except Exception as exc:  # pragma: no cover - server should still try to start
+    except Exception as exc:
         print("WARNING: could not auto-setup the database:", exc)
 
     # 0.0.0.0 = reachable from other computers on the local network.
