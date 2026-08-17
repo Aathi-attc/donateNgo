@@ -113,28 +113,12 @@ INSERT INTO ngos (id, name, tagline, category, location, founded, verified, desc
 (12, 'Sightsavers India', 'Eliminating avoidable blindness', 'Health & Nutrition', 'New Delhi', 1966, 1,
  'An international development organization working in India to eliminate avoidable blindness and promote equal opportunities for people with visual impairments and other disabilities through healthcare, education, and livelihood programmes. Address: B-94, Okhla Industrial Area, Phase II, New Delhi - 110020',
  'info@sightsaversindia.org', '+91 11 4653 8000', 'https://www.sightsaversindia.org'),
-(13, 'CARE India', 'Fighting poverty since 1946', 'Health & Nutrition', 'Noida, Uttar Pradesh', 1946, 1,
- 'One of India''s leading humanitarian organizations working to improve the lives of women, children, and vulnerable communities through healthcare, nutrition, education, livelihood, climate resilience, and emergency response programmes. Address: A-12, Bhilwara Towers, Tower II, Sector 1, Noida, Uttar Pradesh - 201301',
- 'info@careindia.org', '+91 120 404 8250', 'https://www.careindia.org');
-
--- ---------- Donation history (seed) removed: charts now show only real
--- in-app donations made by logged-in users. ----------
-
--- ---------- Seed reviews (written by platform guests) ----------
--- Reviews are intentionally left unseeded: seed reviews were removed on
--- request, and reviews are now written live by logged-in donors instead.
--- (Previous seed data was deleted from this file along with the live table.)
-
-
+(13, 'The Leprosy Mission Trust India', 'Working to end leprosy and its impact', 'Health & Nutrition', 'New Delhi', 1874, 1,
+ 'The largest leprosy-focused non-governmental organisation in India, providing medical care and rehabilitation for people affected by leprosy and other neglected tropical diseases. It runs hospitals, vocational training centres and community projects across nine states. Address: CNI Bhavan, 16, Pandit Pant Marg, New Delhi - 110001',
+ 'info@leprosymission.in', '+91 11 4353 3300', 'https://www.leprosymission.in');
 -- ============================================================
--- LAN SETUP — make every computer on the local network use this
--- MySQL database through the Flask website on this machine.
---
---   ALREADY DONE on this machine:
---     * Flask runs on 0.0.0.0 (see app.py), so the site is reachable
+--     * Flask runs on 0.0.0.0, so the site is reachable
 --       from other computers.
---     * MySQL has no bind-address override, so it already accepts
---       network connections on port 3306.
 --     * A dedicated MySQL user was created:
 --         CREATE USER 'ngoadmin'@'%' IDENTIFIED BY 'ngo123';
 --         GRANT ALL PRIVILEGES ON NGODatabase.* TO 'ngoadmin'@'%';
@@ -149,11 +133,4 @@ INSERT INTO ngos (id, name, tagline, category, location, founded, verified, desc
 --     2. Find this machine's LAN IP:  ipconfig
 --        Other computers then browse to:  http://<this-machine-ip>:5000
 --
---   OPTIONAL — direct DB connections from other computers:
---     * Install `cryptography` on client machines (MySQL 8 uses the
---       caching_sha2_password auth plugin):
---         pip install cryptography
---     * In app.py, if you want a remote machine's Python to talk to
---       this DB directly, use host="<this-machine-ip>" and
---       user="ngoadmin", password="ngo123".
 -- ============================================================
